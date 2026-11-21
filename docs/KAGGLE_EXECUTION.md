@@ -41,9 +41,25 @@ device and runs without device replication.
 ```bash
 bash scripts/setup_kaggle.sh
 PACE_PYTHON=/tmp/pace-kaggle/venv/bin/python
-export CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false
-unset LD_LIBRARY_PATH
+nvidia-smi -L || true
+VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0}"
+export CUDA_VISIBLE_DEVICES="${VISIBLE_DEVICES%%,*}" JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false MPLBACKEND=Agg
+if [[ -r /usr/local/nvidia/lib64/libcuda.so.1 ]]; then
+  export LD_LIBRARY_PATH=/usr/local/nvidia/lib64
+fi
 ```
+
+If an imported notebook fails at `nvidia-smi` with
+`libnvidia-ml.so` missing or exit code 12, use the updated notebook.
+It preserves the original runtime path for the NVML diagnostic and keeps
+the NVIDIA driver path for the CUDA and JAX checks. If the CUDA driver
+check still fails, select a GPU accelerator and start a fresh session or
+save a new GPU-enabled version. [Kaggle GPU runtime definition](https://github.com/Kaggle/docker-python/blob/main/Dockerfile.tmpl) · [NVIDIA NVML reference](https://docs.nvidia.com/deploy/nvml-api/latest/nvml-api-reference.html)
+
+The notebook uses `MPLBACKEND=Agg` for its subprocesses so the isolated
+environment can import Gymnax and Matplotlib. Setup and GPU probe logs go
+under `/kaggle/working/pace/`. Each run saves its training, resume, and
+verification output in the run directory.
 
 ### Smoke and resume
 
@@ -62,6 +78,17 @@ and a toy provisional alpha of 0.01. It keeps the 15×15 Maze and 100 wall
 placement operations. With seed 0, the first batch explores and the next
 three replay. Batch four represents 64 environment transitions, three
 replay PPO batches, and three optimizer steps.
+
+### MiniGrid pilot
+
+Import [`notebooks/kaggle_minigrid_pilot.ipynb`](../notebooks/kaggle_minigrid_pilot.ipynb)
+into Kaggle, select a GPU accelerator, enable Internet, and run all cells.
+The notebook clones the pinned trainer and generates its own levels. It
+uses the paper rollout preset for 24 batches (196,608 interactions), with
+checkpoints at batches 8, 16, and 24. A fresh process resumes from batch 16
+and verifies that the final checkpoint records replay PPO and the expected
+optimizer step count. The pilot uses seed 0 and provisional alpha 0.01 as
+an explicit test choice.
 
 ### Configure a full training run
 
