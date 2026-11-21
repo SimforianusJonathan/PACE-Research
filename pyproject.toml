@@ -28,6 +28,7 @@ maze = [
     "moviepy==1.0.3",
 ]
 test = ["pytest==8.3.5"]
+kaggle = ["jax-cuda12-plugin[with-cuda]==0.4.35"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

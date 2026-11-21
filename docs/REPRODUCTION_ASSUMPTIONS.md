@@ -29,5 +29,29 @@ select new or replay levels -> collect one batch using theta_old
                             -> carry forward the real params and optimizer state
 ```
 
-On the new-level branch the real student stays at `theta_old`. This ordering
-is an implementation hypothesis to verify against author code or clarification.
+On the new-level branch the real student stays at `theta_old`. The MiniGrid
+runner implements this ordering as a hypothesis to verify against author code
+or clarification.
+
+## MiniGrid training and Kaggle decisions
+
+- Use the GAE actor objective, actor/shared parameter mask and gradient-aligned
+  ascent described above. Full training requires an explicitly chosen
+  provisional alpha. The smoke preset's `0.01` serves only as a test value.
+- Fill the buffer through scored exploratory batches. Replay starts once
+  occupancy reaches the reported minimum fill ratio, which can be crossed by a
+  partial batch. No additional initialization rollout is performed.
+- Evict the lowest raw score, as specified in §3.2. Retain JAX-UED's rank and
+  staleness mixture for sampling and its existing duplicate refresh behavior.
+  If a batch samples the same replay slot more than once, the last score for
+  that slot wins via JAX-UED's sequential update.
+- Count real PPO batches, optimizer steps, rollout batches, and interaction
+  steps separately. Table 9's 30,000 PPO batches and Table 2's 245.76M
+  interactions define different budgets once exploratory PPO is disabled.
+  The default training budget follows Table 9, with the rollout cap
+  available to match Table 2. The optimizer schedule follows actual PPO
+  batches, using a fixed 30,000-batch horizon in either paper budget mode.
+- Use the available JAX-UED prefabs for the reference OOD suite. Require
+  explicit assets for missing paper layouts and log the suite and evaluation
+  seed. The full 12-level asset mapping and tuning/test overlap still need
+  verification before making a scientific reproduction claim.

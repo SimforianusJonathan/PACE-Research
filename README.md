@@ -63,5 +63,10 @@ observations, actions, terminal flags, and upstream GAE for that level.
 The GAE objective and actor/shared mask are candidate interpretations of the
 paper. Choose the provisional rate explicitly.
 
-The reference CLI runs upstream PLR. Independent scoring of a batch of
-Maze levels, PACE replay integration, and paper evaluation are later phases.
+## MiniGrid PACE runner
+
+The legacy reference CLI runs upstream PLR. The PACE runner is available
+through `python -m train.pace_minigrid` with `smoke`, `train`, `resume`,
+and `eval` commands. Use `--device cpu` for a local CPU smoke run. See
+[Kaggle execution](docs/KAGGLE_EXECUTION.md) for the GPU environment,
+notebook, checkpoints, paper preset, and OOD evaluation.
