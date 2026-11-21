@@ -5,6 +5,11 @@ Environment Design* (ICML 2026), supplied 22-page `PACE_FINAL.pdf`.
 PDF page numbers below count from the start of the file. The researcher's
 `PACE_REPRODUCTION_CODEX_HANDOFF.md`, §9, defines the phase gates.
 
+Attachment SHA-256 digests:
+
+- Paper `070c51fad3aa419561992cd90233f1c901df146473d352feeebb816020d03cb7`
+- Handoff `0bad40f3776b614f72ce1b6f0c8269f4ec51374bd3dad8c0417e4d9773240af4`
+
 Upstream audited at `0f8f1284677375b889e4f13a32c9617cd009f8c4`
 (`git rev-parse HEAD` on the cloned checkout). Source line references point
 to that revision. [Pinned example][example] · [Pinned framework][upstream]
