@@ -4,7 +4,7 @@ import argparse
 import json
 import math
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import partial
 from pathlib import Path
 
@@ -30,6 +30,9 @@ from train.maze_pace import (
     update_actor_critic_rnn,
 )
 from train.pace_checkpoint import checkpoint_path, read_checkpoint, restore_state, save_checkpoint
+
+
+PAPER_ENV_STEPS = 245_760_000
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,8 @@ class MiniGridConfig:
     scoring_objective: str = "gae_policy_gradient"
     parameter_scope: str = "actor_and_shared"
     provisional_update: str = "gradient_ascent"
+    protocol: str = "algorithm1"
+    max_env_steps: int | None = None
 
     def __post_init__(self):
         if not math.isfinite(self.provisional_alpha) or self.provisional_alpha <= 0:
@@ -74,8 +79,12 @@ class MiniGridConfig:
             raise ValueError("num_envs must be divisible by num_minibatches")
         if self.capacity < 1 or not 0 < self.minimum_fill_ratio <= 1:
             raise ValueError("Replay capacity and minimum fill ratio must be positive")
-        if self.budget not in {"ppo", "rollout"}:
-            raise ValueError("The update budget must count PPO or rollout batches")
+        if self.budget not in {"ppo", "rollout", "env_steps"}:
+            raise ValueError("The budget must count PPO batches, main-loop batches, or environment steps")
+        if self.max_env_steps is not None and (self.budget != "env_steps" or self.max_env_steps <= 0):
+            raise ValueError("A positive max_env_steps is only valid with the env_steps budget")
+        if self.protocol not in {"algorithm1", "legacy"}:
+            raise ValueError("Unknown training protocol")
         if (
             self.prioritization != "rank"
             or self.exploratory_grad_updates
@@ -84,6 +93,16 @@ class MiniGridConfig:
             or self.parameter_scope != "actor_and_shared"
         ):
             raise ValueError("Unsupported MiniGrid PACE policy or score configuration")
+
+    @property
+    def initial_buffer_size(self) -> int:
+        return math.ceil(self.capacity * self.minimum_fill_ratio)
+
+    @property
+    def budget_limit(self) -> int:
+        if self.budget == "env_steps":
+            return self.max_env_steps if self.max_env_steps is not None else PAPER_ENV_STEPS
+        return self.num_updates
 
     @classmethod
     def smoke(cls, seed: int = 0):
@@ -103,6 +122,7 @@ class RunnerState:
     student: PaceTrainState
     rollout_batches: jax.Array
     ppo_batches: jax.Array
+    prefill_env_steps: jax.Array
 
 
 class PaceLevelSampler(LevelSampler):
@@ -121,8 +141,42 @@ def score_levels(params, rollout, initial_carries, score_one):
     )
 
 
-def make_runner(config: MiniGridConfig):
+def interaction_counts(config, rollout_batches, ppo_batches, prefill_env_steps):
+    """Account for collected transitions and count shared trajectories once."""
+    rollout_batches = int(rollout_batches)
+    ppo_batches = int(ppo_batches)
+    batch_steps = config.num_envs * config.num_steps
+    scoring = rollout_batches * batch_steps
+    ppo = ppo_batches * batch_steps
+    prefill = int(prefill_env_steps)
+    shared = ppo if config.protocol == "legacy" else 0
+    return {
+        "env_steps": prefill + scoring + ppo - shared,
+        "prefill_env_steps": prefill,
+        "ppo_env_steps": ppo,
+        "scoring_env_steps": scoring,
+        "shared_env_steps": shared,
+        "main_collection_batches": rollout_batches + (ppo_batches if config.protocol == "algorithm1" else 0),
+    }
+
+
+def budget_progress(config, state, env_steps):
+    if config.budget == "ppo":
+        return int(state.ppo_batches)
+    if config.budget == "rollout":
+        return int(state.rollout_batches)
+    return env_steps
+
+
+def make_runner(config: MiniGridConfig, *, prefill=True):
     """Return the seeded state and a compiled function for advancing it."""
+    env_step_limit = config.budget_limit if config.budget == "env_steps" else None
+    needs_prefill = prefill and config.protocol == "algorithm1"
+    if needs_prefill and env_step_limit is not None:
+        minimum_prefill_steps = config.initial_buffer_size * config.num_steps
+        if env_step_limit < minimum_prefill_steps:
+            raise ValueError(f"Prefill needs at least {minimum_prefill_steps} environment steps")
+
     env = AutoReplayWrapper(Maze(
         max_width=config.maze_size, max_height=config.maze_size,
         agent_view_size=config.agent_view_size, normalize_obs=True,
@@ -143,7 +197,7 @@ def make_runner(config: MiniGridConfig):
 
     def schedule(step):
         ppo_batch = step // (config.ppo_epochs * config.num_minibatches)
-        return config.learning_rate * (1.0 - ppo_batch / config.num_updates)
+        return config.learning_rate * jnp.maximum(0.0, 1.0 - ppo_batch / config.num_updates)
 
     optimizer = optax.chain(optax.clip_by_global_norm(config.max_grad_norm), optax.adam(schedule, eps=1e-5))
     zero = jnp.zeros((), dtype=jnp.int32)
@@ -151,7 +205,7 @@ def make_runner(config: MiniGridConfig):
         apply_fn=net.apply, params=params, tx=optimizer,
         sampler=jax.tree_util.tree_map(jnp.asarray, sampler.initialize(example_level)),
     ).replace(step=zero)
-    initial = RunnerState(rng, student, zero, zero)
+    initial = RunnerState(rng, student, zero, zero, zero)
     score_one = partial(
         pace_score_one_level,
         objective_fn=partial(maze_gae_policy_gradient_objective, net.apply),
@@ -162,28 +216,74 @@ def make_runner(config: MiniGridConfig):
         levels = jax.vmap(generate)(jax.random.split(key, config.num_envs))
         return buffer, jnp.zeros(config.num_envs, jnp.int32), levels
 
-    def step(state, _):
+    def collect(rng, reset_key, student, levels, num_envs):
+        obs, env_state = jax.vmap(env.reset_to_level, (0, 0, None))(
+            jax.random.split(reset_key, num_envs), levels, env_params,
+        )
+        carry = ActorCritic.initialize_carry((num_envs,))
+        (rng, _, _, _, _, last_value), trajectory = sample_trajectories_rnn(
+            rng, env, env_params, student, carry, obs, env_state, num_envs, config.num_steps,
+        )
+        obs, actions, rewards, dones, log_probs, values, _ = trajectory
+        advantages, targets = compute_gae(config.gamma, config.gae_lambda, last_value, values, rewards, dones)
+        return rng, carry, (obs, actions, dones, log_probs, values, targets, advantages)
+
+    def score(student, carry, batch):
+        obs, actions, dones, _, _, _, advantages = batch
+        rollout = MazeScoringRollout(obs, actions, dones, advantages)
+        return score_levels(student.params, rollout, carry, score_one)
+
+    def ppo(rng, student, carry, batch):
+        updated, _ = update_actor_critic_rnn(
+            rng, student, carry, batch, config.num_envs, config.num_steps,
+            config.num_minibatches, config.ppo_epochs, config.clip_eps,
+            config.entropy_coeff, config.critic_coeff,
+        )
+        return updated
+
+    @partial(jax.jit, static_argnames=("num_levels",))
+    def fill_batch(state, num_levels):
+        rng, levels_key, reset_key = jax.random.split(state.rng, 3)
+        levels = jax.vmap(generate)(jax.random.split(levels_key, num_levels))
+        rng, carry, batch = collect(rng, reset_key, state.student, levels, num_levels)
+        scores = score(state.student, carry, batch)
+        buffer, _ = sampler.insert_batch(state.student.sampler, levels, scores)
+        return state.replace(
+            rng=rng, student=state.student.replace(sampler=buffer),
+            prefill_env_steps=state.prefill_env_steps + num_levels * config.num_steps,
+        ), scores
+
+    def plan_step(state):
         rng, decision_key, levels_key, reset_key = jax.random.split(state.rng, 4)
+        replay = sampler.sample_replay_decision(state.student.sampler, decision_key)
+        return rng, levels_key, reset_key, replay
+
+    def step(state, _):
+        rng, levels_key, reset_key, replay = plan_step(state)
         student = state.student
-        replay = sampler.sample_replay_decision(student.sampler, decision_key)
 
         def replay_levels(buffer, key):
             buffer, (indices, levels) = sampler.sample_replay_levels(buffer, key, config.num_envs)
             return buffer, indices, levels
 
         buffer, indices, levels = jax.lax.cond(replay, replay_levels, new_levels, student.sampler, levels_key)
-        obs, env_state = jax.vmap(env.reset_to_level, (0, 0, None))(
-            jax.random.split(reset_key, config.num_envs), levels, env_params,
-        )
-        carry = ActorCritic.initialize_carry((config.num_envs,))
-        (rng, _, _, _, _, last_value), trajectory = sample_trajectories_rnn(
-            rng, env, env_params, student, carry, obs, env_state, config.num_envs, config.num_steps,
-        )
-        obs, actions, rewards, dones, log_probs, values, _ = trajectory
-        advantages, targets = compute_gae(config.gamma, config.gae_lambda, last_value, values, rewards, dones)
-        scores = score_levels(student.params, MazeScoringRollout(obs, actions, dones, advantages), carry, score_one)
+        rng, carry, batch = collect(rng, reset_key, student, levels, config.num_envs)
+
+        if config.protocol == "algorithm1":
+            def collect_after_ppo(rng, student, carry, batch):
+                rng, student = ppo(rng, student, carry, batch)
+                rng, scoring_reset_key = jax.random.split(rng)
+                rng, carry, batch = collect(rng, scoring_reset_key, student, levels, config.num_envs)
+                return rng, student, carry, batch
+
+            rng, student, carry, batch = jax.lax.cond(
+                replay, collect_after_ppo, lambda *args: args, rng, student, carry, batch,
+            )
+
+        scores = score(student, carry, batch)
 
         def refresh(buffer):
+            # PLR refreshes sampled slots in order, even when new scores are lower.
             return sampler.update_batch(buffer, indices, scores)
 
         def insert(buffer):
@@ -191,35 +291,77 @@ def make_runner(config: MiniGridConfig):
 
         buffer = jax.lax.cond(replay, refresh, insert, buffer)
 
-        def ppo(rng, student):
-            (rng, student), _ = update_actor_critic_rnn(
-                rng, student, carry, (obs, actions, dones, log_probs, values, targets, advantages),
-                config.num_envs, config.num_steps, config.num_minibatches, config.ppo_epochs,
-                config.clip_eps, config.entropy_coeff, config.critic_coeff,
+        if config.protocol == "legacy":
+            rng, student = jax.lax.cond(
+                replay, ppo, lambda rng, student, *_: (rng, student), rng, student, carry, batch,
             )
-            return rng, student
 
-        rng, student = jax.lax.cond(replay, ppo, lambda rng, student: (rng, student), rng, student)
-        state = RunnerState(rng, student.replace(sampler=buffer), state.rollout_batches + 1, state.ppo_batches + replay)
+        state = state.replace(
+            rng=rng, student=student.replace(sampler=buffer),
+            rollout_batches=state.rollout_batches + 1, ppo_batches=state.ppo_batches + replay,
+        )
         return state, scores
 
     @partial(jax.jit, static_argnames=("batches",))
-    def advance(state, batches: int):
+    def advance_batches(state, batches: int):
         return jax.lax.scan(step, state, None, length=batches)
 
+    @jax.jit
+    def next_is_replay(state):
+        return plan_step(state)[-1]
+
+    def advance(state, batches: int):
+        if env_step_limit is not None:
+            counts = interaction_counts(config, state.rollout_batches, state.ppo_batches, state.prefill_env_steps)
+            remaining = env_step_limit - counts["env_steps"]
+            batch_steps = config.num_envs * config.num_steps
+            max_cost = 2 * batch_steps if config.protocol == "algorithm1" else batch_steps
+            safe_batches = remaining // max_cost
+            if safe_batches > 0:
+                batches = min(batches, safe_batches)
+            else:
+                # Peek without consuming the key. A pending replay is never
+                # substituted with a cheaper exploration to fit the budget.
+                if remaining < batch_steps or bool(next_is_replay(state)):
+                    return state, jnp.empty((0, config.num_envs), dtype=jnp.float32)
+                batches = min(batches, 1)
+        return advance_batches(state, batches)
+
+    if needs_prefill:
+        while (remaining := config.initial_buffer_size - int(initial.student.sampler["size"])) > 0:
+            num_levels = min(config.num_envs, remaining)
+            if env_step_limit is not None:
+                used = int(initial.prefill_env_steps)
+                num_levels = min(num_levels, (env_step_limit - used) // config.num_steps)
+                if not num_levels:
+                    occupied = config.initial_buffer_size - remaining
+                    raise ValueError(
+                        f"Prefill used {used} environment steps within cap {env_step_limit} "
+                        f"and filled {occupied}/{config.initial_buffer_size} slots"
+                    )
+            initial, scores = fill_batch(initial, num_levels)
+            check_scores(scores, f"during prefill after {int(initial.prefill_env_steps)} environment steps")
     return initial, advance
+
+
+def check_scores(scores, phase):
+    scores = np.asarray(scores)
+    if not np.isfinite(scores).all() or (scores < 0).any():
+        raise FloatingPointError(f"Invalid PACE score {phase}")
+    return scores
 
 
 def _read_runner(path):
     payload = read_checkpoint(path)
     config = MiniGridConfig(**payload["config"])
-    template, advance = make_runner(config)
+    template, advance = make_runner(config, prefill=False)
     state = restore_state(payload, template)
     batches, ppo, optimizer_steps = map(int, (state.rollout_batches, state.ppo_batches, state.student.step))
-    progress = ppo if config.budget == "ppo" else batches
+    counts = interaction_counts(config, batches, ppo, state.prefill_env_steps)
+    progress = budget_progress(config, state, counts["env_steps"])
     if (
         not 0 <= ppo <= batches
-        or progress > config.num_updates
+        or progress > config.budget_limit
         or optimizer_steps != ppo * config.ppo_epochs * config.num_minibatches
     ):
         raise ValueError("Checkpoint contains inconsistent training counters")
@@ -227,56 +369,71 @@ def _read_runner(path):
 
 
 def _run_training(args, output_dir):
+    checkpoints = sorted((output_dir / "checkpoints").glob("step_*.msgpack"))
+    if checkpoints and (args.command != "resume" or checkpoints[-1].resolve() != args.checkpoint.resolve()):
+        raise ValueError("Use an empty output directory or resume from its latest checkpoint")
     if args.command == "resume":
         config, state, advance = _read_runner(args.checkpoint)
     else:
-        config = MiniGridConfig.smoke(args.seed) if args.command == "smoke" else MiniGridConfig(
-            provisional_alpha=args.provisional_alpha, seed=args.seed, budget=args.budget,
+        settings = {"budget": args.budget, "protocol": args.protocol, "max_env_steps": args.max_env_steps}
+        config = (
+            replace(MiniGridConfig.smoke(args.seed), **settings)
+            if args.command == "smoke"
+            else MiniGridConfig(provisional_alpha=args.provisional_alpha, seed=args.seed, **settings)
         )
+        if config.protocol == "algorithm1":
+            print(json.dumps({"prefill_target": config.initial_buffer_size}), flush=True)
         state, advance = make_runner(config)
 
     current = int(state.rollout_batches)
     ppo_batches = int(state.ppo_batches)
-    progress = ppo_batches if config.budget == "ppo" else current
-    if progress >= config.num_updates:
+    counts = interaction_counts(config, current, ppo_batches, state.prefill_env_steps)
+    progress = budget_progress(config, state, counts["env_steps"])
+    if args.command == "resume" and progress >= config.budget_limit:
         raise ValueError("The checkpoint has already reached its training budget")
     if args.stop_after is not None and (
-        args.stop_after <= current or (config.budget == "rollout" and args.stop_after > config.num_updates)
+        args.stop_after <= current or (config.budget == "rollout" and args.stop_after > config.budget_limit)
     ):
         raise ValueError("--stop-after must advance the rollout counter within the configured budget")
-    checkpoints = sorted((output_dir / "checkpoints").glob("step_*.msgpack"))
-    if checkpoints and (args.command != "resume" or checkpoints[-1].resolve() != args.checkpoint.resolve()):
-        raise ValueError("Use an empty output directory or resume from its latest checkpoint")
-
-    print(json.dumps({"config": asdict(config), "start_batch": current, "stop_after": args.stop_after}), flush=True)
+    print(json.dumps({
+        "config": asdict(config), "budget_limit": config.budget_limit, "start_batch": current,
+        "stop_after": args.stop_after, "buffer_size": int(state.student.sampler["size"]), **counts,
+    }), flush=True)
     while True:
-        # A rollout can advance the PPO counter by at most one. Limiting
-        # the chunk to the remaining budget prevents overshooting either mode.
-        count = min(args.chunk_size, config.num_updates - progress)
+        count = args.chunk_size
+        if config.budget != "env_steps":
+            # Each outer iteration can advance the PPO counter by at most one.
+            count = min(count, config.budget_limit - progress)
         if args.stop_after is not None:
             count = min(count, args.stop_after - current)
         if args.checkpoint_interval:
             count = min(count, args.checkpoint_interval - current % args.checkpoint_interval)
         state, scores = advance(state, count)
-        scores = np.asarray(scores)
-        if not np.isfinite(scores).all() or (scores < 0).any():
-            raise FloatingPointError(f"Invalid PACE score after rollout batch {current}")
         current = int(state.rollout_batches)
         ppo_batches = int(state.ppo_batches)
-        progress = ppo_batches if config.budget == "ppo" else current
-        finished = progress == config.num_updates or current == args.stop_after
+        counts = interaction_counts(config, current, ppo_batches, state.prefill_env_steps)
+        scores = check_scores(scores, f"after batch {current} and {counts['env_steps']} environment steps")
+        progress = budget_progress(config, state, counts["env_steps"])
+        stop_reason = None
+        if not scores.size or progress == config.budget_limit:
+            stop_reason = f"{config.budget}_budget"
+        elif current == args.stop_after:
+            stop_reason = "stop_after"
         checkpoint = None
-        if finished or (args.checkpoint_interval and current % args.checkpoint_interval == 0):
+        if stop_reason or (args.checkpoint_interval and current % args.checkpoint_interval == 0):
             checkpoint = checkpoint_path(output_dir, current)
-            save_checkpoint(checkpoint, asdict(config), state)
+            if scores.size or not checkpoint.exists():
+                save_checkpoint(checkpoint, asdict(config), state)
         print(json.dumps({
             "rollout_batches": current, "ppo_batches": ppo_batches,
             "optimizer_steps": int(state.student.step), "buffer_size": int(state.student.sampler["size"]),
-            "env_steps": current * config.num_envs * config.num_steps,
-            "pace_score_mean": float(scores.mean()), "pace_score_max": float(scores.max()),
+            **counts,
+            "budget_remaining": config.budget_limit - progress, "stop_reason": stop_reason,
+            "pace_score_mean": float(scores.mean()) if scores.size else None,
+            "pace_score_max": float(scores.max()) if scores.size else None,
             "checkpoint": str(checkpoint) if checkpoint else None,
         }), flush=True)
-        if finished:
+        if stop_reason:
             break
 
 
@@ -302,11 +459,24 @@ def _cli():
             command.add_argument("--chunk-size", type=int, default=10)
             if name != "resume":
                 command.add_argument("--seed", type=int, default=0)
+                command.add_argument("--budget", choices=("ppo", "rollout", "env_steps"),
+                                     default="ppo" if name == "train" else "rollout",
+                                     help="Count PPO updates, main-loop batches, or all training environment steps")
+                command.add_argument("--max-env-steps", type=int,
+                                     help="Cap actual training interactions (train default: 245760000)")
+                command.add_argument("--protocol", choices=("algorithm1", "legacy"), default="algorithm1",
+                                     help="Use prefill and post-PPO scoring or the original prototype flow")
             if name == "train":
                 command.add_argument("--provisional-alpha", type=float, required=True)
-                command.add_argument("--budget", choices=("ppo", "rollout"), default="ppo",
-                                     help="Count Table 9 PPO updates or match Table 2 rollout interactions")
-    return parser, parser.parse_args()
+    args = parser.parse_args()
+    if args.command in {"train", "smoke"}:
+        if args.max_env_steps is not None and (args.budget != "env_steps" or args.max_env_steps <= 0):
+            parser.error("--max-env-steps requires --budget env_steps and a positive cap")
+        if args.budget == "env_steps" and args.max_env_steps is None:
+            if args.command == "smoke":
+                parser.error("--budget env_steps requires an explicit --max-env-steps for smoke")
+            args.max_env_steps = PAPER_ENV_STEPS
+    return parser, args
 
 
 def main():

@@ -5,10 +5,11 @@ import tempfile
 from pathlib import Path
 
 import jax
+import numpy as np
 from flax import serialization
 
 
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 
 
 def checkpoint_path(output_dir: Path, batches: int) -> Path:
@@ -43,6 +44,11 @@ def save_checkpoint(path: Path, config: dict, state) -> None:
 
 def read_checkpoint(path: Path) -> dict:
     payload = serialization.msgpack_restore(path.read_bytes())
+    if payload.get("version") == 1:
+        # Old checkpoints shared the pre-PPO rollout and filled during the main loop.
+        payload["config"]["protocol"] = "legacy"
+        payload["runner"]["prefill_env_steps"] = np.int32(0)
+        payload["version"] = CHECKPOINT_VERSION
     if payload.get("version") != CHECKPOINT_VERSION:
         raise ValueError(f"Unsupported checkpoint version: {path}")
     return payload
