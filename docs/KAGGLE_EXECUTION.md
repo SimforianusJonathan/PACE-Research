@@ -6,17 +6,18 @@
    into Kaggle. In notebook settings, enable **Internet** and select a GPU
    accelerator. A two-GPU Kaggle allocation also works with one device exposed
    through `CUDA_VISIBLE_DEVICES=0`.
-2. The first cell pins `REPO_REF` to the trainer revision for these
-   notebooks. If you are running from a local snapshot, archive that
-   commit with `git archive --format=zip --output=PACE-Research.zip HEAD`,
-   upload the ZIP to a Kaggle Dataset, attach it, and set `SOURCE` to the
-   ZIP under `/kaggle/input/`. You can also specify a directory containing
-   the extracted source. Clone checkouts use a workspace directory named
-   for the revision. The default clone workflow needs no dataset.
+2. The first code cell pins `REPO_REF` to the trainer commit with the
+   `reuse` baseline. Keep that pin to reproduce the smoke and pilot runs.
+   The clone workflow needs no dataset. To test a
+   local snapshot, attach its source ZIP as a Kaggle Dataset and set `SOURCE`
+   to the ZIP path under `/kaggle/input/`. `SOURCE` also accepts a directory
+   containing the extracted files. A source snapshot uses its own checkout
+   directory. For a committed snapshot, create the ZIP with
+   `git archive --format=zip --output=PACE-Research.zip HEAD`.
 3. Run all cells. The notebook installs the environment, verifies one CUDA
    device with a JIT-compiled matrix multiplication, and starts a four-batch
-   PACE smoke run with a 145-step interaction cap. A fresh process resumes
-   from batch two and verifies 144 interactions with one step left. A final cell
+   PACE smoke run with an 81-step interaction cap. A fresh process resumes
+   from batch two and verifies 80 interactions with one step left. A final cell
    evaluates the restored model on two short Maze3 episodes.
 4. Use **Save Version** to retain outputs or download the checkpoint files
    before the session ends. In a later notebook, attach the saved outputs
@@ -66,7 +67,7 @@ verification output in the run directory.
 
 ```bash
 "$PACE_PYTHON" -m train.pace_minigrid smoke --device gpu \
-  --protocol algorithm1 --budget env_steps --max-env-steps 145 \
+  --protocol reuse --budget env_steps --max-env-steps 81 \
   --output-dir /kaggle/working/pace/smoke --checkpoint-interval 2 --stop-after 2
 
 "$PACE_PYTHON" -m train.pace_minigrid resume --device gpu \
@@ -78,8 +79,8 @@ The smoke preset uses two environments, eight steps per rollout, one PPO
 epoch, and a four-level buffer. It uses replay probability 1 after half fill
 and a toy provisional alpha of 0.01. It keeps the 15×15 Maze and 100 wall
 placement operations. Prefill scores two levels. The four main-loop batches
-all replay, for 144 transitions total: 16 prefill, 64 PPO, and 64 scoring.
-The 145-step cap leaves one step unused.
+all replay. The 64 scoring steps also serve PPO, so the total is 80
+transitions including 16 prefill steps. The cap leaves one step unused.
 
 ### MiniGrid pilot
 
@@ -87,11 +88,11 @@ Import [`notebooks/kaggle_minigrid_pilot.ipynb`](../notebooks/kaggle_minigrid_pi
 into Kaggle, select a GPU accelerator, enable Internet, and run all cells.
 The notebook clones the configured trainer revision and generates its own
 levels. It first scores 500 distinct levels, then runs 24 main-loop batches,
-with checkpoints at batches 8, 16, and 24. Scoring in the main loop accounts
-for 196,608 interactions. Prefill and replay PPO add separate interactions
-reported by the notebook. A fresh process resumes from batch 16
-and verifies that the final checkpoint records replay PPO and the expected
-optimizer step count. The pilot uses seed 0 and provisional alpha 0.01 as
+with checkpoints at batches 8, 16, and 24. The main loop collects
+196,608 transitions and prefill contributes at least 128,000. PPO reuses
+the scoring trajectories on replay, so those transitions count once in
+the total. A fresh process resumes from batch 16 and verifies the
+PPO counter, optimizer step count, and interaction accounting. The pilot uses seed 0 and provisional alpha 0.01 as
 an explicit test choice.
 
 ### Configure a full training run
@@ -113,7 +114,9 @@ The paper preset uses 15×15 maps with 100 wall draws, 32 environments ×
 coefficient `0.001`, and value-loss coefficient `0.5`. It uses a
 1,000-level buffer, replay probability `0.7`, rank temperature `0.8`,
 staleness weight `0.6`, half-fill replay gating, and no real PPO on new
-levels. Train separate seeds in separate output directories.
+levels. The runner makes one replay decision per batch and decays the PPO
+learning rate linearly by completed PPO batches. Train separate seeds in
+separate output directories.
 
 The default `--budget ppo` counts **30,000 real replay PPO batches** as
 stated in Table 9. Use `train --budget rollout` to stop at 30,000 main-loop
@@ -123,8 +126,8 @@ default. Supply `--max-env-steps N` for a different cap.
 
 The environment cap includes prefill, PPO, and scoring transitions.
 The run stops before a complete next iteration would overshoot, then
-reports `budget_remaining` and `stop_reason`. Legacy replay trajectories
-used by both PPO and scoring are counted once. Logs separately report
+reports `budget_remaining` and `stop_reason`. Shared replay trajectories
+in `reuse` and `legacy` count once. Logs separately report
 `ppo_batches`, `rollout_batches` (main-loop batches),
 `main_collection_batches`, and actual `env_steps`. See the
 [training budget audit](REPRODUCTION_ASSUMPTIONS.md#minigrid-training-budget-audit)
@@ -145,9 +148,10 @@ occupancy, prefill interactions, rollout and PPO counters, and the training conf
 published atomically. The runner resets its environments and recurrent carry
 at the beginning of each batch, so a boundary checkpoint is sufficient for
 continuation. For a reproducibility comparison use the same source, package
-lock, and device type. Older checkpoints resume under their original
-`legacy` protocol. Select `train --protocol legacy` for a new comparison
-with the earlier shared-rollout flow.
+lock, and device type. Checkpoints resume with their stored protocol.
+Version 1 checkpoints resume under `legacy`. Select
+`train --protocol algorithm1` to compare fresh replay scoring after PPO,
+or `train --protocol legacy` to compare the original empty-buffer flow.
 
 ### OOD evaluation
 
@@ -160,8 +164,8 @@ with the earlier shared-rollout flow.
 
 For an experimental checkpoint, use `--episodes 100 --horizon 250` and
 `--suite paper --levels-json /kaggle/input/.../paper-layouts.json`. The
-default `reference` suite covers the seven pinned JAX-UED prefabs that
-correspond to paper names. The `paper` suite requires the five additional
+default `reference` suite covers seven pinned JAX-UED prefabs whose wall
+geometry and start/goal tiles match Figure 11. The `paper` suite requires the five additional
 assets `SimpleCrossing`, `FourRooms`, `SmallCorridor`, `LargeCorridor`, and
 `PerfectMazeMedium`. The CLI fails if any are missing. Supply a JSON
 object mapping level names to ASCII rows using `#` (wall), `.` (free),
@@ -170,29 +174,35 @@ object mapping level names to ASCII rows using `#` (wall), `.` (free),
 with `--horizon 3000`. Evaluation records per-level solved rates, raw
 returns, and episode lengths using an independent seed and a frozen
 checkpoint. The full paper layouts and multi-seed aggregates remain
-separate from the reference evaluation. [Pinned JAX-UED prefabs](https://github.com/DramaCow/jaxued/blob/0f8f1284677375b889e4f13a32c9617cd009f8c4/src/jaxued/environments/maze/level.py)
+separate from the reference evaluation. [Figure 11 layout audit](PAPER_TO_CODE_MAPPING.md#figure-11-layout-audit)
 
 ## PACE fidelity
 
-Each level is scored from its own rollout. On new levels, scoring uses the
-current policy without real PPO. On replay, the runner performs real PPO,
-then resets the same levels for new trajectories with the updated policy.
-The scorer makes one temporary actor update and measures the squared
-parameter displacement divided by alpha. The buffer evicts by raw score,
-samples by mixed rank and staleness, and refreshes replayed scores using
-the existing PLR rule.
-The paper does not uniquely specify the provisional optimizer
-implementation, learning rate, loss, or actor/critic parameter scope. The
-runner uses one gradient-ascent step on the fixed, unnormalized GAE actor
-objective, over actor and shared leaves. See the [reproduction assumptions](REPRODUCTION_ASSUMPTIONS.md).
+Each level is scored from its own trajectory. The default `reuse`
+baseline uses the current policy for scoring. On replay it passes the
+same rollout to real PPO. The `algorithm1` comparison recollects scoring
+trajectories under the updated policy. Both protocols score the initial
+prefill with the initial policy.
+
+The scorer makes one temporary, unclipped ascent step on the actor’s
+fixed, unnormalized GAE objective over the shared CNN/LSTM and actor head,
+then measures the squared parameter displacement divided by explicit
+alpha. Only real PPO uses the Table 9 gradient clip. The buffer evicts by
+raw score, samples by rank and staleness, and refreshes replay scores with
+PLR’s `update_batch()`. [Reproduction assumptions](REPRODUCTION_ASSUMPTIONS.md)
 
 ## Local verification
 
 - The Linux bootstrap dry run resolved 93 packages with CPython 3.11.15
   and uv 0.13.5. Use `bash scripts/setup_kaggle.sh --dry-run` to check
   dependency resolution without installing the CUDA runtime packages.
-- `python -m pytest -q` passed 36 tests on CPU, including the prefill,
-  post-PPO scoring, environment cap, and checkpoint tests.
+- `python -m pytest -q` passed 38 tests on CPU, including both scoring
+  protocols, prefill, environment caps, and checkpoint restoration.
+- The `reuse` smoke workflow resumed from batch two to batch four, used
+  80 of 81 allowed transitions, and completed the two-episode OOD check.
+- The seed-0 `reuse` pilot resumed from batch 16 to 24. The final
+  checkpoint recorded 15 PPO batches, 75 optimizer steps, and 324,608
+  actual transitions, including 128,000 prefill transitions.
 - A CPU prefill check with 32 environments and one step per level scored
   exactly 500 distinct levels before any PPO update.
 - The `algorithm1` CPU smoke resumed from batch two to batch four and
