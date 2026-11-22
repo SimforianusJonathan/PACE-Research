@@ -66,7 +66,7 @@ $env:JAX_PLATFORMS = 'cpu'
 & $pacePython -m pip check
 & $pacePython -c "import jax, jaxued; print(jax.devices())"
 & $pacePython -m pytest -q
-& $pacePython -m train.pace_minigrid smoke --device cpu --budget env_steps --max-env-steps 145
+& $pacePython -m train.pace_minigrid smoke --device cpu --budget env_steps --max-env-steps 81
 ```
 
 On Linux or macOS, use `.venv/bin/python` and install with
@@ -81,9 +81,10 @@ runs a small test, `train` uses the paper's MiniGrid configuration with an
 explicit `--provisional-alpha`, `resume` continues from a checkpoint, and
 `eval` evaluates a checkpoint on held-out layouts.
 
-The default `--protocol algorithm1` pre-fills the replay buffer and collects
-a separate scoring rollout after PPO on replayed levels. Use
-`--protocol legacy` to reproduce the earlier trajectory-reuse protocol.
+The default `--protocol reuse` prefills 500 scored levels with the paper
+preset and shares each replay rollout between scoring and PPO. Select
+`--protocol algorithm1` for a fresh scoring rollout after replay PPO, or
+`--protocol legacy` for the original empty-buffer baseline.
 
 - `--budget ppo` counts completed PPO batches. The paper preset targets 30,000.
 - `--budget rollout` counts main-loop batches.

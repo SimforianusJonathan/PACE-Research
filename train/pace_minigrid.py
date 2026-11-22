@@ -67,7 +67,7 @@ class MiniGridConfig:
     scoring_objective: str = "gae_policy_gradient"
     parameter_scope: str = "actor_and_shared"
     provisional_update: str = "gradient_ascent"
-    protocol: str = "algorithm1"
+    protocol: str = "reuse"
     max_env_steps: int | None = None
 
     def __post_init__(self):
@@ -83,7 +83,7 @@ class MiniGridConfig:
             raise ValueError("The budget must count PPO batches, main-loop batches, or environment steps")
         if self.max_env_steps is not None and (self.budget != "env_steps" or self.max_env_steps <= 0):
             raise ValueError("A positive max_env_steps is only valid with the env_steps budget")
-        if self.protocol not in {"algorithm1", "legacy"}:
+        if self.protocol not in {"reuse", "algorithm1", "legacy"}:
             raise ValueError("Unknown training protocol")
         if (
             self.prioritization != "rank"
@@ -97,6 +97,14 @@ class MiniGridConfig:
     @property
     def initial_buffer_size(self) -> int:
         return math.ceil(self.capacity * self.minimum_fill_ratio)
+
+    @property
+    def uses_prefill(self) -> bool:
+        return self.protocol != "legacy"
+
+    @property
+    def separate_replay_rollouts(self) -> bool:
+        return self.protocol == "algorithm1"
 
     @property
     def budget_limit(self) -> int:
@@ -149,14 +157,14 @@ def interaction_counts(config, rollout_batches, ppo_batches, prefill_env_steps):
     scoring = rollout_batches * batch_steps
     ppo = ppo_batches * batch_steps
     prefill = int(prefill_env_steps)
-    shared = ppo if config.protocol == "legacy" else 0
+    shared = 0 if config.separate_replay_rollouts else ppo
     return {
         "env_steps": prefill + scoring + ppo - shared,
         "prefill_env_steps": prefill,
         "ppo_env_steps": ppo,
         "scoring_env_steps": scoring,
         "shared_env_steps": shared,
-        "main_collection_batches": rollout_batches + (ppo_batches if config.protocol == "algorithm1" else 0),
+        "main_collection_batches": rollout_batches + (ppo_batches if config.separate_replay_rollouts else 0),
     }
 
 
@@ -171,7 +179,7 @@ def budget_progress(config, state, env_steps):
 def make_runner(config: MiniGridConfig, *, prefill=True):
     """Return the seeded state and a compiled function for advancing it."""
     env_step_limit = config.budget_limit if config.budget == "env_steps" else None
-    needs_prefill = prefill and config.protocol == "algorithm1"
+    needs_prefill = prefill and config.uses_prefill
     if needs_prefill and env_step_limit is not None:
         minimum_prefill_steps = config.initial_buffer_size * config.num_steps
         if env_step_limit < minimum_prefill_steps:
@@ -269,7 +277,7 @@ def make_runner(config: MiniGridConfig, *, prefill=True):
         buffer, indices, levels = jax.lax.cond(replay, replay_levels, new_levels, student.sampler, levels_key)
         rng, carry, batch = collect(rng, reset_key, student, levels, config.num_envs)
 
-        if config.protocol == "algorithm1":
+        if config.separate_replay_rollouts:
             def collect_after_ppo(rng, student, carry, batch):
                 rng, student = ppo(rng, student, carry, batch)
                 rng, scoring_reset_key = jax.random.split(rng)
@@ -291,7 +299,7 @@ def make_runner(config: MiniGridConfig, *, prefill=True):
 
         buffer = jax.lax.cond(replay, refresh, insert, buffer)
 
-        if config.protocol == "legacy":
+        if not config.separate_replay_rollouts:
             rng, student = jax.lax.cond(
                 replay, ppo, lambda rng, student, *_: (rng, student), rng, student, carry, batch,
             )
@@ -315,7 +323,7 @@ def make_runner(config: MiniGridConfig, *, prefill=True):
             counts = interaction_counts(config, state.rollout_batches, state.ppo_batches, state.prefill_env_steps)
             remaining = env_step_limit - counts["env_steps"]
             batch_steps = config.num_envs * config.num_steps
-            max_cost = 2 * batch_steps if config.protocol == "algorithm1" else batch_steps
+            max_cost = 2 * batch_steps if config.separate_replay_rollouts else batch_steps
             safe_batches = remaining // max_cost
             if safe_batches > 0:
                 batches = min(batches, safe_batches)
@@ -381,7 +389,7 @@ def _run_training(args, output_dir):
             if args.command == "smoke"
             else MiniGridConfig(provisional_alpha=args.provisional_alpha, seed=args.seed, **settings)
         )
-        if config.protocol == "algorithm1":
+        if config.uses_prefill:
             print(json.dumps({"prefill_target": config.initial_buffer_size}), flush=True)
         state, advance = make_runner(config)
 
@@ -464,8 +472,8 @@ def _cli():
                                      help="Count PPO updates, main-loop batches, or all training environment steps")
                 command.add_argument("--max-env-steps", type=int,
                                      help="Cap actual training interactions (train default: 245760000)")
-                command.add_argument("--protocol", choices=("algorithm1", "legacy"), default="algorithm1",
-                                     help="Use prefill and post-PPO scoring or the original prototype flow")
+                command.add_argument("--protocol", choices=("reuse", "algorithm1", "legacy"), default="reuse",
+                                     help="Prefill with shared rollouts, prefill with separate rollouts, or legacy without prefill")
             if name == "train":
                 command.add_argument("--provisional-alpha", type=float, required=True)
     args = parser.parse_args()

@@ -70,8 +70,8 @@ def test_checkpoint_preserves_training_and_replay_state(tmp_path):
     np.testing.assert_array_equal(scores, expected_scores)
     assert (int(actual.rollout_batches), int(actual.ppo_batches), int(actual.student.step)) == (4, 4, 4)
     assert interaction_counts(config, actual.rollout_batches, actual.ppo_batches, actual.prefill_env_steps) == {
-        "env_steps": 144, "prefill_env_steps": 16, "ppo_env_steps": 64,
-        "scoring_env_steps": 64, "shared_env_steps": 0, "main_collection_batches": 8,
+        "env_steps": 80, "prefill_env_steps": 16, "ppo_env_steps": 64,
+        "scoring_env_steps": 64, "shared_env_steps": 64, "main_collection_batches": 4,
     }
     with pytest.raises(FileExistsError):
         save_checkpoint(path, asdict(config), actual)
@@ -101,9 +101,11 @@ def mock_training(monkeypatch):
     monkeypatch.setattr(minigrid, "pace_score_one_level", score)
 
 
-@pytest.mark.parametrize("replay_prob, expected_score, expected_ppo", [(0.0, 29, 0), (1.0, 18, 1)])
-def test_prefill_and_scoring_use_the_expected_policy(mock_training, replay_prob, expected_score, expected_ppo):
-    config = replace(MiniGridConfig.smoke(), capacity=6, replay_prob=replay_prob)
+@pytest.mark.parametrize("protocol, replay_prob, expected_score, expected_ppo", [
+    ("reuse", 0.0, 29, 0), ("reuse", 1.0, 29, 1), ("algorithm1", 1.0, 18, 1),
+])
+def test_prefill_and_scoring_use_the_expected_policy(mock_training, protocol, replay_prob, expected_score, expected_ppo):
+    config = replace(MiniGridConfig.smoke(), protocol=protocol, capacity=6, replay_prob=replay_prob)
     template, _ = make_runner(config, prefill=False)
     initial, advance = make_runner(config)
     # Three levels split into batches of two and one, with no real update.
@@ -119,7 +121,7 @@ def test_prefill_and_scoring_use_the_expected_policy(mock_training, replay_prob,
     if not expected_ppo:
         assert_tree_equal(updated.student.params, initial.student.params)
     else:
-        # PLR refresh keeps the same levels and accepts a lower score on replay.
+        # PLR keeps the replayed levels even if post-PPO scoring lowers their scores.
         occupied_scores = updated.student.sampler["scores"][:3]
         assert int(updated.student.sampler["size"]) == 3
         assert float(occupied_scores.min()) == expected_score
@@ -151,6 +153,7 @@ def test_legacy_checkpoint_preserves_old_protocol(tmp_path):
         ("algorithm1", 1.0, 49, (1, 1, 48, 2)),
         ("algorithm1", 0.0, 33, (1, 0, 32, 1)),
         ("legacy", 1.0, 49, (3, 2, 48, 3)),
+        ("reuse", 1.0, 81, (4, 4, 80, 4)),
     ],
 )
 def test_env_budget_counts_all_phases_and_keeps_pending_branch(mock_training, protocol, replay_prob, cap, expected):
@@ -193,7 +196,7 @@ def test_env_budget_counts_duplicate_prefill_attempts(mock_training, monkeypatch
 def test_env_step_cap_and_counters_survive_resume(mock_training, tmp_path, monkeypatch, capsys):
     # After one replay, 48 are spent and the next replay needs 32.
     args = [
-        "train.pace_minigrid", "smoke", "--budget", "env_steps",
+        "train.pace_minigrid", "smoke", "--protocol", "algorithm1", "--budget", "env_steps",
         "--max-env-steps", "79", "--stop-after", "1",
     ]
     monkeypatch.setattr("sys.argv", args)
@@ -250,7 +253,7 @@ def test_paper_ood_suite_requires_the_missing_layouts(tmp_path):
 def test_paper_protocol_matches_table_9():
     config = MiniGridConfig(provisional_alpha=0.01)
     assert config.budget == "ppo"
-    assert config.protocol == "algorithm1" and config.initial_buffer_size == 500
+    assert config.protocol == "reuse" and config.initial_buffer_size == 500
     assert (config.maze_size, config.n_walls, config.num_updates, config.num_steps, config.num_envs) == (
         15, 100, 30_000, 256, 32,
     )
