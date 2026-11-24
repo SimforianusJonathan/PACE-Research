@@ -1,10 +1,12 @@
 """Zero-shot MiniGrid evaluation for fixed, named Maze layouts."""
 
 import json
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import struct
 from jaxued.environments import Maze
 from jaxued.environments.maze import Level
 
@@ -25,6 +27,12 @@ PAPER_LEVELS = (
     "Labyrinth", "Labyrinth2", "SmallCorridor", "LargeCorridor",
     "Maze", "Maze2", "Maze3", "PerfectMazeMedium",
 )
+
+
+@struct.dataclass
+class FrozenPolicy:
+    apply_fn: Callable = struct.field(pytree_node=False)
+    params: Any
 
 
 def _load_layout(name, rows):
@@ -68,32 +76,45 @@ def load_suite(suite, layout_path=None, selected=None):
     return names, Level.stack(levels)
 
 
+def make_evaluator(levels, agent_view_size, horizon):
+    height, width = levels.wall_map.shape[-2:]
+    count = levels.wall_map.shape[0]
+    env = Maze(max_height=height, max_width=width, agent_view_size=agent_view_size, normalize_obs=True)
+    env_params = env.default_params.replace(max_steps_in_episode=horizon)
+    net = ActorCritic(env.action_space(env_params).n)
+    carry = ActorCritic.initialize_carry((count,))
+
+    def episode(key, params):
+        reset_key, rollout_key = jax.random.split(key)
+        observations, initial = jax.vmap(env.reset_to_level, (0, 0, None))(
+            jax.random.split(reset_key, count), levels, env_params,
+        )
+        student = FrozenPolicy(apply_fn=net.apply, params=params)
+        _, rewards, lengths = evaluate_rnn(
+            rollout_key, env, env_params, student, carry, observations, initial, horizon,
+        )
+        mask = jnp.arange(horizon)[:, None] < lengths
+        return (rewards * mask).sum(axis=0), lengths
+
+    run_episodes = jax.jit(jax.vmap(episode, (0, None)))
+
+    def evaluate(params, episodes, seed):
+        keys = jax.random.split(jax.random.PRNGKey(seed), episodes)
+        results = [jax.device_get(run_episodes(keys[i:i + 8], params)) for i in range(0, episodes, 8)]
+        return tuple(map(np.concatenate, zip(*results)))
+
+    return evaluate
+
+
 def evaluate_checkpoint(args, config, state):
     if args.episodes <= 0 or args.horizon <= 0:
         raise ValueError("Evaluation episode count and horizon must be positive")
     names, levels = load_suite(args.suite, args.levels_json, args.levels)
-    height, width = levels.wall_map.shape[-2:]
-    env = Maze(max_height=height, max_width=width, agent_view_size=config.agent_view_size, normalize_obs=True)
-    env_params = env.default_params.replace(max_steps_in_episode=args.horizon)
-    carry = ActorCritic.initialize_carry((len(names),))
-
-    def episode(key, student):
-        reset_key, rollout_key = jax.random.split(key)
-        observations, initial = jax.vmap(env.reset_to_level, (0, 0, None))(
-            jax.random.split(reset_key, len(names)), levels, env_params,
-        )
-        _, rewards, lengths = evaluate_rnn(
-            rollout_key, env, env_params, student, carry, observations, initial, args.horizon,
-        )
-        mask = jnp.arange(args.horizon)[:, None] < lengths
-        return (rewards * mask).sum(axis=0), lengths
-
-    run_episodes = jax.jit(jax.vmap(episode, (0, None)))
-    keys = jax.random.split(jax.random.PRNGKey(args.eval_seed), args.episodes)
-    results = [jax.device_get(run_episodes(keys[i:i + 8], state.student)) for i in range(0, args.episodes, 8)]
-    returns, lengths = map(np.concatenate, zip(*results))
+    evaluate = make_evaluator(levels, config.agent_view_size, args.horizon)
+    returns, lengths = evaluate(state.student.params, args.episodes, args.eval_seed)
     solved = returns > 0
     summary = {
+        "method": config.method,
         "checkpoint": str(args.checkpoint),
         "training_seed": config.seed, "rollout_batches": int(state.rollout_batches),
         "eval_seed": args.eval_seed, "suite": args.suite, "episodes": args.episodes, "horizon": args.horizon,

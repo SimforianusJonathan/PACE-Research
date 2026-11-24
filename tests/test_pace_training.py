@@ -8,7 +8,9 @@ import pytest
 from flax import serialization
 
 import train.pace_minigrid as minigrid
+from train.maze_baselines import level_score
 from train.pace_checkpoint import read_checkpoint, restore_state, save_checkpoint
+from train.pace_metrics import rollout_metrics
 from train.pace_minigrid import MiniGridConfig, PaceLevelSampler, interaction_counts, make_runner, score_levels
 from train.pace_ood import PAPER_LEVELS, REFERENCE_PREFABS, load_suite
 
@@ -31,6 +33,23 @@ def test_scoring_preserves_level_axis_and_student_snapshot():
     actual = score_levels(params, trajectories, carries, score_one)
     np.testing.assert_array_equal(actual, expected)
     np.testing.assert_array_equal(score_levels(params, trajectories[:, ::-1], carries[::-1], score_one), expected[::-1])
+
+
+def test_curve_counts_completed_episodes_and_all_step_rewards():
+    rewards = jnp.array([[2., 1.], [3., 5.], [9., 2.], [4., 3.]])
+    dones = jnp.array([[False, True], [True, False], [False, True], [False, False]])
+    np.testing.assert_array_equal(rollout_metrics(rewards, dones), [3, 3, 13, 5, 29])
+
+
+def test_baseline_score_definitions():
+    advantages = jnp.array([[1., -2.], [-3., 4.]])
+    dones = jnp.array([[False, False], [True, False]])
+    values = jnp.array([[0., 1.], [2., 3.]])
+    returns = jnp.array([0., 0.])
+    np.testing.assert_array_equal(level_score("plr", dones, values, advantages, returns), [2., 3.])
+    np.testing.assert_array_equal(level_score("plr_perp", dones, values, advantages, returns), [-1., -np.inf])
+    assert minigrid.MiniGridConfig.baseline("accel").n_walls == 0
+    assert minigrid.MiniGridConfig.baseline("plr").replay_prob == 0.5
 
 
 def test_full_buffer_evicts_lowest_raw_score():

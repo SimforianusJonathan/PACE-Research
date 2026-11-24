@@ -95,6 +95,26 @@ the total. A fresh process resumes from batch 16 and verifies the
 PPO counter, optimizer step count, and interaction accounting. The pilot uses seed 0 and provisional alpha 0.01 as
 an explicit test choice.
 
+### Full training across Kaggle sessions
+
+Import [the full-run notebook](../notebooks/kaggle_minigrid_full.ipynb), select
+a GPU and enable Internet. It defaults to session 1, seed 0, `algorithm1`,
+and 30,000 real PPO batches. The provisional alpha of `0.01` is a documented
+reproduction choice. Use **Save & Run All** to save the session output.
+
+1. Session 1 pauses at main-loop batch 21,000 and saves checkpoints every 250
+   main-loop batches. `run_summary.json` gives the latest checkpoint path
+   and the PPO and interaction counts at that checkpoint.
+2. In the next session, attach the previous notebook output via **Add
+   Input**. Set `SESSION = 2` and `RESUME_CHECKPOINT` to the attached
+   checkpoint path. Keep the same seed and alpha. Session 2 checks those
+   fields and resumes to the stored PPO budget in a new output directory.
+
+Each session caps training at ten hours. If the cap is reached, the notebook
+reports the most recent fully written checkpoint that appears in the
+training log. Use that checkpoint to continue in session 2. Keep the
+training logs and summaries from each session to retain the complete history.
+
 ### Configure a full training run
 
 Supply and record the provisional alpha you intend to use. The command
@@ -155,6 +175,9 @@ or `train --protocol legacy` to compare the original empty-buffer flow.
 
 ### OOD evaluation
 
+The [MiniGrid baseline guide](MINIGRID_BASELINES.md) covers the DR, PLR,
+PLR⊥, and ACCEL notebook, presets, and shared analysis outputs.
+
 ```bash
 "$PACE_PYTHON" -m train.pace_minigrid eval --device gpu \
   --checkpoint /kaggle/working/pace/smoke/checkpoints/step_00000004.msgpack \
@@ -175,6 +198,57 @@ with `--horizon 3000`. Evaluation records per-level solved rates, raw
 returns, and episode lengths using an independent seed and a frozen
 checkpoint. The full paper layouts and multi-seed aggregates remain
 separate from the reference evaluation. [Figure 11 layout audit](PAPER_TO_CODE_MAPPING.md#figure-11-layout-audit)
+
+### Data to retain for the paper comparison
+
+The full-run notebook records `learning_curve.csv` once per main-loop
+batch (8,192 or 16,384 transitions at the paper rollout size). Its columns
+include actual interactions, PPO and loop counts, total rewards, completed
+episode counts and returns, and PACE scores. PPO and scoring rollouts are
+kept in separate columns. Episode-return means leave incomplete tails out
+and remain empty for batches with no terminal episode. Use the episode counts
+as weights when smoothing rewards. Logging adds zero environment transitions.
+
+After training, attach all session outputs for a seed and select
+`SESSION = 3`. Fill `ANALYSIS_RUN_DIRS` with the folders that contain
+`checkpoints/` and `learning_curve.csv`. The analysis merges saved
+training rows and evaluates OOD every 500 main-loop batches by default
+(roughly 2 checkpoint intervals). Use `OOD_EVERY = 250` to evaluate every
+periodic checkpoint saved at the default interval. Curve checkpoints use
+20 episodes per level and the final checkpoint uses 100, with horizon 250.
+
+- `training_curve.csv` combines the dense training curves for the seed.
+- `ood_episodes.csv` keeps raw returns, lengths, and solved flags.
+  `ood_curve.csv` summarizes them by checkpoint and layout.
+- `cv_scores.csv` keeps all repeated PACE scores and `cv_summary.csv`
+  summarizes their sample standard deviations and CVs by checkpoint and
+  layout. The defaults are up to five evenly spaced saved checkpoints and
+  30 repeats per pair. Zero means have undefined CV. The reference CV set
+  uses `16Rooms` as a proxy for the paper's unresolved `6Rooms` label.
+  Supply `CV_LAYOUTS_JSON` and matching `CV_LEVELS` to use identified grids.
+- `final_ood.json` provides one final score per seed and layout. Session 4
+  combines matching final reports into `seed_layout_solve_rates.csv`,
+  `ood_bar_chart.csv`, and `ood_aggregate.json`. The latter contains IQM
+  and Optimality Gap. With multiple seeds it also records 95% percentile
+  intervals from a bootstrap stratified by layout.
+
+With `OOD_LAYOUTS_JSON` empty, the analysis evaluates the seven verified
+reference layouts and labels the outputs accordingly. Supply the extra
+verified grids to evaluate all 12. While the analysis edits are local,
+attach the source ZIP as a Kaggle input and set `SOURCE` to that archive.
+
+- Keep the final checkpoint for each training seed and the run configuration
+  and log. Record the actual interactions, PPO batch count, seed, trainer
+  revision, dependency lock, and provisional alpha.
+- Evaluate each final checkpoint on the same 12 Figure 11 layouts with
+  100 episodes per layout and a 250-step horizon. Keep the layout keys and
+  input grids, evaluation seed and settings, per-episode return and length,
+  and the resulting solve rate per layout and training seed. The OOD CLI
+  records per-episode returns and lengths and per-layout solve rates.
+- Use the seed-by-layout solve rates to report mean and standard deviation,
+  IQM, and optimality gap with 95% confidence intervals for the aggregates.
+  The paper reports ten training seeds. The seven verified layouts support
+  reference checks while the five remaining assets are being verified.
 
 ## PACE fidelity
 
