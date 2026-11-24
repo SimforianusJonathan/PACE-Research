@@ -234,8 +234,8 @@ periodic checkpoint saved at the default interval. Curve checkpoints use
 
 With `OOD_LAYOUTS_JSON` empty, the analysis evaluates the seven verified
 reference layouts and labels the outputs accordingly. Supply the extra
-verified grids to evaluate all 12. While the analysis edits are local,
-attach the source ZIP as a Kaggle input and set `SOURCE` to that archive.
+verified grids to evaluate all 12. The full notebook clones its pinned Git revision by default.
+For an attached source archive, set `SOURCE` to the archive path.
 
 - Keep the final checkpoint for each training seed and the run configuration
   and log. Record the actual interactions, PPO batch count, seed, trainer
