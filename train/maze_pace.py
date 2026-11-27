@@ -341,12 +341,7 @@ class MazeScoringRollout(NamedTuple):
     advantages: jax.Array
 
 
-def maze_gae_policy_gradient_objective(apply_fn, params, rollout, initial_rnn_state):
-    """Compute the actor objective suggested by App. B.3, Eq. 24.
-
-    The rollout starts with the supplied unbatched carry and has one time
-    axis. A done at timestep t resets the carry before observing t + 1.
-    """
+def _maze_scoring_policy(apply_fn, params, rollout, initial_rnn_state):
     obs, actions, dones, advantages = rollout
     shapes_match = actions.shape == dones.shape == advantages.shape
     if not shapes_match or actions.ndim != 1 or actions.size == 0:
@@ -357,6 +352,22 @@ def maze_gae_policy_gradient_objective(apply_fn, params, rollout, initial_rnn_st
     inputs = jax.tree_util.tree_map(lambda x: x[:, None, ...], (obs, previous_dones))
     carry = jax.tree_util.tree_map(lambda x: x[None, ...], initial_rnn_state)
     _, policy, _ = apply_fn(params, inputs, carry)
+    return policy
+
+
+def maze_action_logits(apply_fn, params, rollout, initial_rnn_state):
+    """Replay a level with this policy and return its (time, action) logits."""
+    return _maze_scoring_policy(apply_fn, params, rollout, initial_rnn_state).logits.squeeze(1)
+
+
+def maze_gae_policy_gradient_objective(apply_fn, params, rollout, initial_rnn_state):
+    """Compute the actor objective suggested by App. B.3, Eq. 24.
+
+    The rollout starts with the supplied unbatched carry and has one time
+    axis. A done at timestep t resets the carry before observing t + 1.
+    """
+    policy = _maze_scoring_policy(apply_fn, params, rollout, initial_rnn_state)
+    actions, advantages = rollout.actions, rollout.advantages
     log_probs = policy.log_prob(actions[:, None]).squeeze(1)
     return (log_probs * jax.lax.stop_gradient(advantages)).mean()
 

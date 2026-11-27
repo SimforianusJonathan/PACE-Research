@@ -1,4 +1,5 @@
 from functools import partial
+import math
 
 from flax.core import freeze
 from flax.training.train_state import TrainState
@@ -8,7 +9,12 @@ import numpy as np
 import optax
 import pytest
 
-from pace import pace_score_one_level, sum_squared_tree_difference
+from pace import (
+    mean_action_distribution_score,
+    pace_policy_score_one_level,
+    pace_score_one_level,
+    sum_squared_tree_difference,
+)
 
 
 def quadratic_objective(param, target, initial_carry):
@@ -146,3 +152,67 @@ def test_scoring_preserves_real_train_state_and_next_optimizer_update():
     actual = state.apply_gradients(grads=real_grad(state.params))
     for actual_leaf, expected_leaf in zip(jax.tree_util.tree_leaves(actual), jax.tree_util.tree_leaves(expected)):
         np.testing.assert_array_equal(actual_leaf, expected_leaf)
+
+
+def test_policy_scores_use_all_actions_and_average_over_time():
+    p = np.array([[0.8, 0.2], [0.2, 0.8]])
+    q = np.array([[0.5, 0.5], [0.4, 0.6]])
+    old, new = jnp.log(p), jnp.log(q)
+    forward = np.sum(p * np.log(p / q), axis=-1).mean()
+    reverse = np.sum(q * np.log(q / p), axis=-1).mean()
+
+    assert mean_action_distribution_score(old, new, metric="kl") == pytest.approx(forward)
+    assert mean_action_distribution_score(new, old, metric="kl") == pytest.approx(reverse)
+    # TVD is the squared unit-ground-distance W2 at each step.
+    assert mean_action_distribution_score(old, new, metric="tvd") == pytest.approx((0.3 + 0.2) / 2)
+    assert mean_action_distribution_score(new, old, metric="tvd") == pytest.approx(0.25)
+
+
+def test_policy_scores_support_masked_actions_and_large_log_ratios():
+    old = jnp.array([[0.0, -jnp.inf, -jnp.inf]])
+    new = jnp.array([[-jnp.inf, 0.0, -jnp.inf]])
+    mix = jnp.array([[0.0, 0.0, -jnp.inf]])
+    assert mean_action_distribution_score(old, old, metric="kl") == 0.0
+    assert mean_action_distribution_score(old, old, metric="tvd") == 0.0
+    assert mean_action_distribution_score(old, new, metric="tvd") == 1.0
+    assert jnp.isposinf(mean_action_distribution_score(old, new, metric="kl"))
+    assert mean_action_distribution_score(old, mix, metric="kl") == pytest.approx(math.log(2))
+    far_old = jnp.array([[0.0, -800.0]])
+    far_new = jnp.array([[-800.0, 0.0]])
+    assert mean_action_distribution_score(far_old, far_new, metric="kl") == pytest.approx(800.0)
+
+
+def test_forward_kl_is_resolved_for_a_small_provisional_change():
+    delta = 2.0**-12
+    old = jnp.array([[0.0, 0.0]])
+    new = jnp.array([[delta, -delta]])
+    expected = math.log1p(2 * math.sinh(delta / 2)**2)
+    assert mean_action_distribution_score(old, new, metric="kl") == pytest.approx(expected, rel=1e-3, abs=0)
+
+
+@pytest.mark.parametrize("metric", ["kl", "tvd"])
+def test_policy_score_compiles_and_uses_the_same_masked_provisional_step(metric):
+    old = {"actor": jnp.array([0.0, 0.0, 0.0]), "excluded": jnp.array(0.0)}
+    gradient = jnp.array([1.0, 0.0, -1.0])
+    alpha = 0.5
+    observations = jnp.array([0.0, 1.0])
+    carry = jnp.array(1.0)
+    excluded_action = jnp.array([0.0, 1.0, 0.0])
+
+    def objective(params, *_):
+        return (params["actor"] * gradient).sum() + 10.0 * params["excluded"]
+
+    def logits(params, history, initial):
+        return (history + initial)[:, None] * params["actor"] + params["excluded"] * excluded_action
+
+    score = jax.jit(partial(
+        pace_policy_score_one_level, objective_fn=objective, policy_logits_fn=logits,
+        provisional_alpha=alpha, policy_param_mask={"actor": True, "excluded": False}, metric=metric,
+    ))(old, observations, carry)
+    q = np.exp(np.outer([1.0, 2.0], [0.5, 0.0, -0.5]))
+    q /= q.sum(axis=-1, keepdims=True)
+    if metric == "kl":
+        expected = np.sum(np.log((1 / 3) / q) / 3, axis=-1).mean()
+    else:
+        expected = (0.5 * np.abs(1 / 3 - q).sum(axis=-1)).mean()
+    assert score == pytest.approx(expected)

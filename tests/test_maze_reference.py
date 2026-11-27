@@ -9,10 +9,11 @@ from jaxued.level_sampler import LevelSampler
 import numpy as np
 import pytest
 
-from pace import pace_score_one_level, sum_squared_tree_difference
+from pace import pace_policy_score_one_level, pace_score_one_level, sum_squared_tree_difference
 from train.maze_pace import (
     ActorCritic,
     MazeScoringRollout,
+    maze_action_logits,
     maze_actor_shared_mask,
     maze_gae_policy_gradient_objective,
 )
@@ -81,6 +82,25 @@ def test_actor_critic_single_level_scoring_uses_real_flax_tree():
     )
     assert jnp.isfinite(score) and score > 0
     assert score == pytest.approx(sum_squared_tree_difference(updated, variables) / alpha, rel=1e-4)
+
+    logits_fn = partial(maze_action_logits, model.apply)
+    old_logits = np.asarray(logits_fn(variables, rollout, carry), dtype=np.float64)
+    new_logits = np.asarray(logits_fn(updated, rollout, carry), dtype=np.float64)
+    assert old_logits.shape == new_logits.shape == (2, env.action_space(env.default_params).n)
+    p, q = np.exp(old_logits), np.exp(new_logits)
+    p /= p.sum(axis=-1, keepdims=True)
+    q /= q.sum(axis=-1, keepdims=True)
+    expected = {
+        "kl": np.sum(p * np.log(p / q), axis=-1).mean(),
+        "tvd": (0.5 * np.abs(p - q).sum(axis=-1)).mean(),
+    }
+    for metric in ("kl", "tvd"):
+        policy_score = pace_policy_score_one_level(
+            variables, rollout, carry, objective_fn=objective_fn, policy_logits_fn=logits_fn,
+            provisional_alpha=alpha, policy_param_mask=mask, metric=metric,
+        )
+        assert policy_score > 0
+        assert policy_score == pytest.approx(expected[metric], rel=2e-3, abs=1e-10)
 
 
 def test_pinned_sampler_rank_and_staleness_distribution():
