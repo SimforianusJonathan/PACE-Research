@@ -15,24 +15,21 @@ from jaxued.utils import compute_max_returns
 from jaxued.wrappers import AutoReplayWrapper
 from scipy.stats import trim_mean
 
-from pace import pace_score_one_level
 from train.maze_baselines import level_score
-from train.maze_pace import (
-    ActorCritic, MazeScoringRollout, compute_gae, maze_actor_shared_mask,
-    maze_gae_policy_gradient_objective, sample_trajectories_rnn,
-)
+from train.maze_pace import ActorCritic, MazeScoringRollout, compute_gae, sample_trajectories_rnn
 from train.pace_checkpoint import read_checkpoint
-from train.pace_minigrid import MiniGridConfig, interaction_counts, score_levels
+from train.pace_minigrid import MiniGridConfig, interaction_counts, make_pace_level_scorer, score_levels
 from train.pace_ood import FrozenPolicy, load_suite, make_evaluator
 
 
 DEFAULT_CV_LEVELS = ("16Rooms", "Labyrinth", "Labyrinth2", "Maze", "Maze2")
 
 
-def write_csv(path, rows):
-    with path.open("w", newline="", encoding="utf-8") as stream:
+def write_csv(path, rows, *, append=False):
+    with path.open("a" if append else "w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=rows[0].keys())
-        writer.writeheader()
+        if stream.tell() == 0:
+            writer.writeheader()
         writer.writerows(rows)
 
 
@@ -105,10 +102,7 @@ def make_cv_sampler(config, levels, initial_params):
     net = ActorCritic(env.action_space(env_params).n)
     carry = ActorCritic.initialize_carry((count,))
     if config.method == "pace":
-        score_one = partial(
-            pace_score_one_level, objective_fn=partial(maze_gae_policy_gradient_objective, net.apply),
-            provisional_alpha=config.provisional_alpha, policy_param_mask=maze_actor_shared_mask(initial_params),
-        )
+        score_one = make_pace_level_scorer(config, initial_params, net.apply)
 
     def rollout_score(params, key):
         reset_key, rollout_key = jax.random.split(key)
@@ -142,18 +136,20 @@ class MiniGridAnalysis:
         self.evaluate = make_evaluator(self.levels, config.agent_view_size, args.horizon)
         self.cv_names = ()
         self.cv_fingerprint = None
-        self.ood_rows, self.curve_rows, self.cv_rows, self.cv_summary = [], [], [], []
+        self.ood_rows, self.curve_rows, self.ood_metric_rows = [], [], []
+        self.cv_rows, self.cv_summary = [], []
         if config.score_type is not None:
             suite = "custom" if args.cv_levels_json else "reference"
             self.cv_names, levels = load_suite(suite, args.cv_levels_json, selected=args.cv_levels)
             self.cv_fingerprint = layout_fingerprint(self.cv_names, levels)
             self.sample_scores = make_cv_sampler(config, levels, params)
 
-    def record(self, params, point, *, ood, cv, final):
+    def record(self, params, point, *, ood, cv, final, live_output=None):
         args, config = self.args, self.config
         if ood:
             episodes = args.final_episodes if final else args.curve_episodes
             returns, lengths = self.evaluate(params, episodes, args.eval_seed)
+            curve_start, episode_start = len(self.curve_rows), len(self.ood_rows)
             for i, name in enumerate(self.names):
                 self.curve_rows.append({
                     **point, "level": name, "final": int(final), "episodes": episodes,
@@ -166,6 +162,19 @@ class MiniGridAnalysis:
                         "eval_seed": args.eval_seed, "horizon": args.horizon, "episode": episode,
                         "return": float(reward), "length": int(length), "solved": int(reward > 0),
                     })
+            solve_rates = (returns > 0).mean(axis=0)
+            aggregates = aggregate_metrics(solve_rates[None, :])
+            metrics = {
+                **point, "suite": args.suite, "final": int(final), "layout_count": len(self.names),
+                "episodes_per_layout": episodes, "solve_rate_mean": float(solve_rates.mean()),
+                "mean_return": float(returns.mean()),
+                "iqm": aggregates["iqm"]["estimate"], "optimality_gap": aggregates["optimality_gap"]["estimate"],
+            }
+            self.ood_metric_rows.append(metrics)
+            if live_output is not None:
+                write_csv(live_output / "ood_curve.csv", self.curve_rows[curve_start:], append=True)
+                write_csv(live_output / "ood_episodes.csv", self.ood_rows[episode_start:], append=True)
+                write_csv(live_output / "ood_metrics_by_eval.csv", [metrics], append=True)
         if cv and self.cv_names:
             batch = point["rollout_batches"]
             key = jax.random.fold_in(jax.random.PRNGKey(args.cv_seed), batch)
@@ -196,13 +205,14 @@ class MiniGridAnalysis:
         output_dir.mkdir(parents=True, exist_ok=True)
         write_csv(output_dir / "ood_episodes.csv", self.ood_rows)
         write_csv(output_dir / "ood_curve.csv", self.curve_rows)
+        write_csv(output_dir / "ood_metrics_by_eval.csv", self.ood_metric_rows)
         if self.cv_rows:
             write_csv(output_dir / "cv_scores.csv", self.cv_rows)
             write_csv(output_dir / "cv_summary.csv", self.cv_summary)
         defined = [row["cv"] for row in self.cv_summary if row["cv"] is not None]
         ppo = final_point["ppo_batches"]
         report = {
-            "method": config.method, "seed": config.seed, "suite": args.suite,
+            "method": config.method, "experiment": config.experiment_name, "seed": config.seed, "suite": args.suite,
             "layout_sha256": layout_fingerprint(self.names, self.levels),
             "training_config": {key: value for key, value in asdict(config).items() if key != "seed"},
             "final_checkpoint": final_point["checkpoint"], "ppo_batches": ppo,
@@ -247,7 +257,7 @@ def collect_analysis(args):
             mutations=int(state["student"].get("mutation_batches", 0)),
         )
         point = {
-            "method": config.method, "seed": config.seed, "checkpoint": str(path),
+            "method": config.experiment_name, "seed": config.seed, "checkpoint": str(path),
             "rollout_batches": batch, "ppo_batches": ppo, "env_steps": counts["env_steps"],
         }
         analysis.record(state["student"]["params"], point, ood=batch in curve_points, cv=batch in cv_batches, final=final)
@@ -287,7 +297,7 @@ def aggregate_reports(paths, out):
     cohorts = {}
     for report in reports:
         config = MiniGridConfig(**report["training_config"])
-        method = f"pace-{config.protocol}" if config.method == "pace" else config.method
+        method = config.experiment_name
         cohorts.setdefault(method, []).append((report, config))
 
     names = tuple(reports[0]["levels"])

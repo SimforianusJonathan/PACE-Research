@@ -22,12 +22,13 @@ from jaxued.level_sampler import LevelSampler
 from jaxued.utils import compute_max_returns
 from jaxued.wrappers import AutoReplayWrapper
 
-from pace import pace_score_one_level
+from pace import pace_policy_score_one_level, pace_score_one_level
 from train.maze_baselines import METHOD_SCORES, BaselineTrainState, make_baseline_step
 from train.maze_pace import (
     ActorCritic,
     MazeScoringRollout,
     compute_gae,
+    maze_action_logits,
     maze_actor_shared_mask,
     maze_gae_policy_gradient_objective,
     sample_trajectories_rnn,
@@ -38,6 +39,7 @@ from train.pace_metrics import ROLLOUT_FIELDS, append_curve, prepare_curve, roll
 
 
 PAPER_ENV_STEPS = 245_760_000
+PACE_SCORE_METRICS = ("l2", "kl", "tvd")
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,7 @@ class MiniGridConfig:
     method: str = "pace"
     mutation_edits: int = 5
     episode_horizon: int = 250
+    score_metric: str = "l2"
 
     def __post_init__(self):
         if self.method not in {"pace", *METHOD_SCORES}:
@@ -95,6 +98,7 @@ class MiniGridConfig:
         if self.method != "pace":
             if (
                 self.protocol != "jaxued" or self.provisional_alpha is not None
+                or self.score_metric != "l2"
                 or self.prioritization != "rank"
                 or self.exploratory_grad_updates != (self.method in {"dr", "plr"})
                 or self.scoring_objective != METHOD_SCORES[self.method]
@@ -107,6 +111,8 @@ class MiniGridConfig:
             raise ValueError("provisional_alpha must be finite and positive")
         if self.protocol not in {"reuse", "algorithm1", "legacy"}:
             raise ValueError("Unknown PACE training protocol")
+        if self.score_metric not in PACE_SCORE_METRICS:
+            raise ValueError("Unknown PACE score metric")
         if (
             self.prioritization != "rank"
             or self.exploratory_grad_updates
@@ -130,7 +136,16 @@ class MiniGridConfig:
 
     @property
     def score_type(self):
-        return "pace" if self.method == "pace" else METHOD_SCORES[self.method]
+        if self.method != "pace":
+            return METHOD_SCORES[self.method]
+        return "pace" if self.score_metric == "l2" else self.score_metric
+
+    @property
+    def experiment_name(self) -> str:
+        if self.method != "pace":
+            return self.method
+        name = f"pace-{self.protocol}"
+        return name if self.score_metric == "l2" else f"{name}-{self.score_metric}"
 
     @classmethod
     def baseline(cls, method, seed=0, *, smoke=False, **settings):
@@ -189,6 +204,20 @@ def score_levels(params, rollout, initial_carries, score_one):
     level_rollouts = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), rollout)
     return jax.lax.map(
         lambda data: score_one(params, data[0], data[1]), (level_rollouts, initial_carries),
+    )
+
+
+def make_pace_level_scorer(config, params, apply_fn):
+    options = {
+        "objective_fn": partial(maze_gae_policy_gradient_objective, apply_fn),
+        "provisional_alpha": config.provisional_alpha,
+        "policy_param_mask": maze_actor_shared_mask(params),
+    }
+    if config.score_metric == "l2":
+        return partial(pace_score_one_level, **options)
+    return partial(
+        pace_policy_score_one_level, policy_logits_fn=partial(maze_action_logits, apply_fn),
+        metric=config.score_metric, **options,
     )
 
 
@@ -284,11 +313,7 @@ def make_runner(config: MiniGridConfig, *, prefill=True, record_metrics=False):
             mutation_pending=jnp.array(False), parent_levels=parents,
         ).replace(step=zero)
     initial = RunnerState(rng, student, zero, zero, zero)
-    score_one = partial(
-        pace_score_one_level,
-        objective_fn=partial(maze_gae_policy_gradient_objective, net.apply),
-        provisional_alpha=config.provisional_alpha, policy_param_mask=maze_actor_shared_mask(params),
-    )
+    score_one = make_pace_level_scorer(config, params, net.apply)
 
     def new_levels(buffer, key):
         levels = jax.vmap(generate)(jax.random.split(key, config.num_envs))
@@ -479,7 +504,9 @@ def _run_training(args, output_dir):
     checkpoints = sorted((output_dir / "checkpoints").glob("step_*.msgpack"))
     if checkpoints and (args.command != "resume" or checkpoints[-1].resolve() != args.checkpoint.resolve()):
         raise ValueError("Use an empty output directory or resume from its latest checkpoint")
-    if args.final_only and curve_path is not None and curve_path.exists():
+    if args.final_only and any((output_dir / name).exists() for name in (
+        "learning_curve.csv", "ood_curve.csv", "ood_episodes.csv", "ood_metrics_by_eval.csv",
+    )):
         raise ValueError("Use a new output directory for a checkpoint-free run")
     if args.command == "resume":
         config, state, advance = _read_runner(args.checkpoint, record_metrics=args.log_learning_curve)
@@ -487,6 +514,7 @@ def _run_training(args, output_dir):
         settings = {"budget": args.budget, "max_env_steps": args.max_env_steps}
         if args.method == "pace":
             settings["protocol"] = args.protocol or "reuse"
+            settings["score_metric"] = args.score_metric or "l2"
             config = (
                 replace(MiniGridConfig.smoke(args.seed), **settings)
                 if args.command == "smoke"
@@ -521,10 +549,14 @@ def _run_training(args, output_dir):
             return interaction_counts(config, batch, ppo, prefill_steps, **branches)
 
     analysis, cv_targets, analysis_seconds = None, [], 0.0
+    next_ood_env_steps = None
     if args.final_only:
         from train.pace_analysis import MiniGridAnalysis
 
         analysis = MiniGridAnalysis(args, config, state.student.params)
+        if args.ood_every_env_steps:
+            next_ood_env_steps = (counts["env_steps"] // args.ood_every_env_steps + 1) * args.ood_every_env_steps
+            max_batch_env_steps = config.num_envs * config.num_steps * (2 if config.separate_replay_rollouts else 1)
         if config.score_type is not None:
             cv_targets = sorted({
                 math.ceil(config.budget_limit * i / args.cv_checkpoints)
@@ -533,11 +565,11 @@ def _run_training(args, output_dir):
 
         def evaluate_live(*, ood, cv, final):
             point = {
-                "method": config.method, "seed": config.seed, "checkpoint": None,
+                "method": config.experiment_name, "seed": config.seed, "checkpoint": None,
                 "rollout_batches": current, "ppo_batches": ppo_batches, "env_steps": counts["env_steps"],
             }
             start = perf_counter()
-            analysis.record(state.student.params, point, ood=ood, cv=cv, final=final)
+            analysis.record(state.student.params, point, ood=ood, cv=cv, final=final, live_output=output_dir)
             return point, perf_counter() - start
 
         _, analysis_seconds = evaluate_live(ood=True, cv=False, final=False)
@@ -550,7 +582,11 @@ def _run_training(args, output_dir):
         if args.stop_after is not None:
             count = min(count, args.stop_after - current)
         if analysis is not None:
-            count = min(count, args.ood_every - current % args.ood_every)
+            if next_ood_env_steps is None:
+                count = min(count, args.ood_every - current % args.ood_every)
+            else:
+                remaining = next_ood_env_steps - counts["env_steps"]
+                count = min(count, max(1, remaining // max_batch_env_steps))
             if cv_targets:
                 count = min(count, cv_targets[0] - ppo_batches)
         elif args.checkpoint_interval:
@@ -568,6 +604,7 @@ def _run_training(args, output_dir):
             append_curve(
                 curve_path, config.seed, current, ppo_batches, step_counts, scores, metrics,
                 method=config.method, score_type=config.score_type, final_counts=counts,
+                experiment=config.experiment_name if analysis is not None else None,
             )
         progress = budget_progress(config, state, counts["env_steps"])
         stop_reason = None
@@ -592,7 +629,12 @@ def _run_training(args, output_dir):
         print(json.dumps(summary), flush=True)
         if analysis is not None:
             final = stop_reason is not None
-            ood = final or current % args.ood_every == 0
+            if next_ood_env_steps is None:
+                ood = final or current % args.ood_every == 0
+            else:
+                ood = final or counts["env_steps"] >= next_ood_env_steps
+                if ood:
+                    next_ood_env_steps = (counts["env_steps"] // args.ood_every_env_steps + 1) * args.ood_every_env_steps
             cv = bool(cv_targets and ppo_batches == cv_targets[0])
             if cv:
                 cv_targets.pop(0)
@@ -605,6 +647,7 @@ def _run_training(args, output_dir):
                 total_seconds = perf_counter() - started
                 report = {
                     "status": "training_complete", "config": asdict(config), "counts": summary,
+                    "experiment": config.experiment_name, "ood_every_env_steps": args.ood_every_env_steps,
                     "checkpoint": None, "learning_curve": str(curve_path),
                     "timing": {"total_seconds": round(total_seconds, 2),
                                "analysis_seconds": round(analysis_seconds, 2),
@@ -652,22 +695,28 @@ def _cli():
                                      help="Cap actual training interactions (train default: 245760000)")
                 command.add_argument("--protocol", choices=("reuse", "algorithm1", "legacy"),
                                      help="Prefill with shared rollouts, prefill with separate rollouts, or legacy without prefill")
+                command.add_argument("--score-metric", choices=PACE_SCORE_METRICS,
+                                     help="PACE provisional score. Defaults to l2.")
                 command.add_argument("--final-only", action="store_true",
-                                     help="Train and evaluate baselines in memory without writing checkpoints")
+                                     help="Train and evaluate in memory without writing checkpoints")
+                command.add_argument("--ood-every-env-steps", type=int,
+                                     help="Evaluate at training interaction milestones with --final-only")
                 add_analysis_options(command)
             if name == "train":
                 command.add_argument("--provisional-alpha", type=float)
     args = parser.parse_args()
     if args.command in {"train", "smoke"}:
         if args.final_only:
-            if args.method == "pace" or args.budget != "ppo" or args.stop_after is not None:
-                parser.error("--final-only requires a baseline with a PPO budget and no --stop-after")
+            if args.budget != "ppo" or args.stop_after is not None:
+                parser.error("--final-only requires a PPO budget and no --stop-after")
             if min(args.horizon, args.ood_every, args.curve_episodes, args.final_episodes, args.cv_checkpoints) < 1 or args.cv_repeats < 2:
                 parser.error("Evaluation requires positive counts and at least two CV repeats")
             args.log_learning_curve = True
+        if args.ood_every_env_steps is not None and (not args.final_only or args.ood_every_env_steps < 1):
+            parser.error("--ood-every-env-steps must be positive and requires --final-only")
         alpha = getattr(args, "provisional_alpha", None)
-        if args.method != "pace" and (args.protocol is not None or alpha is not None):
-            parser.error("Protocol and provisional alpha are PACE settings")
+        if args.method != "pace" and (args.protocol is not None or alpha is not None or args.score_metric is not None):
+            parser.error("Protocol, provisional alpha and score metric are PACE settings")
         if args.command == "train" and args.method == "pace" and alpha is None:
             parser.error("PACE training requires --provisional-alpha")
         if args.max_env_steps is not None and (args.budget != "env_steps" or args.max_env_steps <= 0):

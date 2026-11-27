@@ -1,3 +1,4 @@
+import csv
 import json
 from dataclasses import asdict, replace
 
@@ -7,6 +8,7 @@ import numpy as np
 import pytest
 from flax import serialization
 
+import train.pace_analysis as analysis
 import train.pace_minigrid as minigrid
 from train.maze_baselines import level_score
 from train.pace_checkpoint import read_checkpoint, restore_state, save_checkpoint
@@ -284,3 +286,60 @@ def test_paper_protocol_matches_table_9():
     )
     assert (config.capacity, config.replay_prob, config.staleness_coeff, config.temperature) == (1000, 0.7, 0.6, 0.8)
     assert (config.minimum_fill_ratio, config.prioritization, config.exploratory_grad_updates) == (0.5, "rank", False)
+
+
+def test_live_ood_metrics_append_with_actual_interactions(monkeypatch, tmp_path):
+    monkeypatch.setattr("sys.argv", [
+        "train.pace_minigrid", "smoke", "--budget", "ppo", "--final-only",
+        "--score-metric", "tvd", "--ood-every-env-steps", "25", "--curve-episodes", "2", "--final-episodes", "3",
+    ])
+    _, args = minigrid._cli()
+    config = replace(MiniGridConfig.smoke(), score_metric="tvd", protocol="algorithm1")
+
+    def evaluator(levels, *_):
+        count = levels.wall_map.shape[0]
+
+        def evaluate(_params, episodes, _seed):
+            returns = np.full((episodes, count), 0.5)
+            returns[:, -1] = 0
+            return returns, np.ones_like(returns, dtype=int)
+
+        return evaluate
+
+    monkeypatch.setattr(analysis, "make_evaluator", evaluator)
+    monkeypatch.setattr(analysis, "make_cv_sampler", lambda *_: None)
+    live = analysis.MiniGridAnalysis(args, config, None)
+    for batch, steps, final in ((0, 16, False), (1, 48, False), (2, 80, True)):
+        point = dict(method=config.experiment_name, seed=0, checkpoint=None,
+                     rollout_batches=batch, ppo_batches=batch, env_steps=steps)
+        live.record(None, point, ood=True, cv=False, final=final, live_output=tmp_path)
+    with (tmp_path / "ood_metrics_by_eval.csv").open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    assert [(r["env_steps"], r["episodes_per_layout"], r["final"]) for r in rows] == [
+        ("16", "2", "0"), ("48", "2", "0"), ("80", "3", "1"),
+    ]
+    assert rows[-1]["method"] == "pace-algorithm1-tvd"
+    assert float(rows[-1]["solve_rate_mean"]) == pytest.approx(6 / 7)
+    assert float(rows[-1]["mean_return"]) == pytest.approx(3 / 7)
+    assert float(rows[-1]["iqm"]) == 1.0
+    assert float(rows[-1]["optimality_gap"]) == pytest.approx(1 / 7)
+
+
+def test_aggregate_separates_pace_score_metrics(tmp_path):
+    paths = []
+    for metric in ("l2", "kl", "tvd"):
+        config = asdict(MiniGridConfig(provisional_alpha=0.01, protocol="algorithm1", score_metric=metric))
+        del config["seed"]
+        if metric == "l2":
+            del config["score_metric"]  # Existing L2 reports predate this setting.
+        report = {
+            "training_complete": True, "suite": "reference", "layout_sha256": "same-layouts",
+            "horizon": 250, "episodes": 100, "eval_seed": 10000, "ppo_batches": 30000,
+            "training_config": config, "seed": 0, "levels": {"maze": 0.5},
+        }
+        path = tmp_path / f"{metric}.json"
+        path.write_text(json.dumps(report), encoding="utf-8")
+        paths.append(path)
+    analysis.aggregate_reports(paths, tmp_path)
+    aggregate = json.loads((tmp_path / "ood_aggregate.json").read_text(encoding="utf-8"))
+    assert set(aggregate["by_method"]) == {"pace-algorithm1", "pace-algorithm1-kl", "pace-algorithm1-tvd"}

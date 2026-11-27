@@ -58,7 +58,8 @@ def score_summary(scores, score_type):
     }
 
 
-def append_curve(path, seed, current, ppo_batches, counts, scores, metrics, *, method, score_type, final_counts):
+def append_curve(path, seed, current, ppo_batches, counts, scores, metrics, *, method, score_type, final_counts,
+                 experiment=None):
     trained, ppo_metrics, scoring_metrics, *branches = jax.device_get(metrics)
     ppo_batches -= int(trained.sum())
     branch_ids = trained.astype(int) if method == "pace" else branches[0]
@@ -76,8 +77,9 @@ def append_curve(path, seed, current, ppo_batches, counts, scores, metrics, *, m
             **counts(batch, ppo_batches, replay=replay, mutations=mutations), "replay": int(branch == 1),
             **score_summary(level_scores, score_type),
         }
-        if method != "pace":
-            row.update(method=method, branch=("new", "replay", "mutation")[branch], ppo_updated=int(updated))
+        if method != "pace" or experiment is not None:
+            row.update(method=experiment or method, branch=("new", "replay", "mutation")[branch],
+                       ppo_updated=int(updated))
         for phase, stats in (("ppo", ppo), ("scoring", scoring)):
             values = dict(zip(ROLLOUT_FIELDS, stats.tolist()))
             row.update({f"{phase}_{name}": value for name, value in values.items()})
