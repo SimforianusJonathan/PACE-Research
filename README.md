@@ -41,13 +41,14 @@ magnitude serves a different role as a direct level-priority signal in PLR.
 
 ### Kaggle GPU
 
-Import either notebook in Kaggle, enable a GPU accelerator and Internet
-access, and run all cells. Both notebooks clone a pinned revision of this
+Import a notebook in Kaggle, enable a GPU accelerator and Internet
+access, and run all cells. The notebooks clone a pinned revision of this
 repository, install the GPU dependencies, and generate their MiniGrid levels
 within the run.
 
 - [Smoke test](notebooks/kaggle_minigrid.ipynb) checks GPU setup, training, checkpoint resume, and a short Maze3 evaluation.
 - [MiniGrid pilot](notebooks/kaggle_minigrid_pilot.ipynb) uses the paper's rollout dimensions and exercises checkpoint resume over a short run.
+- [Full PACE scoring runs](notebooks/kaggle_minigrid_pace_policy.ipynb) run L2, KL, or TVD to 30,000 PPO batches and export training and live OOD curves.
 
 See the [Kaggle execution guide](docs/KAGGLE_EXECUTION.md) for the pinned
 environment, checkpoint paths, and evaluation options.

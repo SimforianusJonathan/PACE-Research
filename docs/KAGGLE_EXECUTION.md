@@ -95,6 +95,28 @@ the total. A fresh process resumes from batch 16 and verifies the
 PPO counter, optimizer step count, and interaction accounting. The pilot uses seed 0 and provisional alpha 0.01 as
 an explicit test choice.
 
+### Full PACE training with live evaluation
+
+Import [the full-run PACE scoring notebook](../notebooks/kaggle_minigrid_pace_policy.ipynb)
+into Kaggle. Enable **GPU** and **Internet**. The notebook fetches its pinned
+trainer revision from GitHub. Pick `SCORE_METRIC = "l2"`, `"kl"`, or
+`"tvd"` and set `SEED`. The default `algorithm1` protocol reaches 30,000
+actual PPO batches in a single run. Set `SMOKE_TEST = True` for a four-batch
+trial.
+
+The trainer records rollout rows in `training_curve.csv` and measures OOD
+performance in memory around each 4,096,000 training interactions. It records
+the actual interaction count at each evaluation. The seven reference layouts
+use 20 episodes per layout at intermediate evaluations and 100 at the end.
+The ZIP contains training and OOD curves, raw OOD episodes, CV data, and
+final aggregates. `ood_metrics_by_eval.csv` includes mean return, solve rate,
+IQM, and optimality gap (1 − mean OOD solve rate). The workflow stores metrics
+instead of model state. Restarting an interrupted run starts from its seed.
+
+Use `python -m train.pace_plot --run-dirs RUN_L2 RUN_KL RUN_TVD --output-dir PLOTS`
+to plot completed runs together. Use matching seeds, protocols, and evaluation
+settings for the comparison.
+
 ### Full training across Kaggle sessions
 
 Import [the full-run notebook](../notebooks/kaggle_minigrid_full.ipynb), select
